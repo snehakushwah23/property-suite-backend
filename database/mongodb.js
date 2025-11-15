@@ -24,15 +24,15 @@ const connectDB = async () => {
         isActive: true
       });
       
-      console.log('✅ Default admin user created');
+      console.log(' Default admin user created');
       console.log('   Username: admin');
       console.log('   Password: admin@123');
     } else {
-      console.log('✅ Admin user already exists');
+      console.log('Admin user already exists');
     }
     
   } catch (error) {
-    console.error('❌ MongoDB connection error:', error);
+    console.error('MongoDB connection error:', error);
     process.exit(1);
   }
 };
