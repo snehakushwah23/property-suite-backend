@@ -1,6 +1,18 @@
+// Investor routes are defined later after mongoose is initialized
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
+const PDFDocument = require('pdfkit');
+const nodemailer = require('nodemailer');
+let twilioClient = null;
+try {
+  const twilio = require('twilio');
+  if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+    twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+  }
+} catch (err) {
+  console.log('ℹ️ Twilio package not available or not configured. WhatsApp sending disabled.');
+}
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -1926,27 +1938,222 @@ app.post('/api/advance-transactions', async (req, res) => {
       transactionId: `ADV-${Date.now()}`,
       transactionDate: req.body.transactionDate || new Date()
     };
-
+    // Save to DB if available
+    let transaction = null;
     if (mongoose.connection.readyState === 1) {
-      const transaction = new AdvanceTransaction(transactionData);
+      transaction = new AdvanceTransaction(transactionData);
       await transaction.save();
       console.log(`✅ Advance transaction created: ${transaction.transactionId}`);
-      return res.status(201).json({ success: true, transaction });
+    } else {
+      // Mock response for disconnected state
+      transaction = {
+        _id: `674350a1b2c3d4e5f6789${Date.now().toString().slice(-3)}`,
+        ...transactionData,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+      console.log(`⚠️ DB disconnected - transaction created in memory: ${transaction.transactionId}`);
     }
 
-    // Mock response for disconnected state
-    const mockTransaction = {
-      _id: `674350a1b2c3d4e5f6789${Date.now().toString().slice(-3)}`,
-      ...transactionData,
-      createdAt: new Date(),
-      updatedAt: new Date()
+    // Generate memo PDF buffer
+    const generateAdvanceMemoPDF = (tx) => {
+      return new Promise((resolve, reject) => {
+        try {
+          const doc = new PDFDocument({ size: 'A4', margin: 40 });
+          const chunks = [];
+          doc.on('data', (chunk) => chunks.push(chunk));
+          doc.on('end', () => resolve(Buffer.concat(chunks)));
+
+          // Header / Company info
+          doc.fontSize(14).text('Samarth Developers Pro Pvt. Ltd.', { align: 'left' });
+          doc.moveDown(0.2);
+          doc.fontSize(10).text('SOMANING KOLI - Samarth Developers Pro Pvt. Ltd.');
+          doc.fontSize(9).text('GSTIN: 27DNJPK9124G1ZR');
+          doc.moveDown(0.5);
+
+          doc.fontSize(12).text('Advance Payment Received', { align: 'center' });
+          doc.moveDown(0.5);
+
+          // Customer & Plot Details
+          doc.fontSize(11).text(`Customer: ${tx.customerName || ''}`);
+          doc.text(`Phone: ${tx.customerPhone || ''}`);
+          if (tx.customerEmail) doc.text(`Email: ${tx.customerEmail}`);
+          doc.moveDown(0.3);
+
+          doc.text(`Village: ${tx.village || ''}    Survey No.: ${tx.plotNumber || ''}    Area: ${tx.area || ''}`);
+          doc.moveDown(0.3);
+
+          // Amounts
+          doc.text(`Total Deal Amount: ₹${tx.dealAmount || tx.amount || 0}`);
+          doc.text(`Advance Received: ₹${tx.amount}`);
+          const balance = (tx.dealAmount ? parseFloat(tx.dealAmount || 0) - parseFloat(tx.amount || 0) : 0);
+          doc.text(`Remaining Balance: ₹${balance}`);
+          doc.moveDown(0.3);
+
+          doc.text(`Payment Mode: ${tx.paymentMode || 'Cash'}`);
+          doc.text(`Date: ${new Date(tx.transactionDate).toLocaleString()}`);
+          doc.moveDown(0.6);
+
+          doc.text('Notes:', { underline: true });
+          doc.fontSize(9).text(tx.notes || tx.description || '', { align: 'left' });
+          doc.moveDown(1);
+
+          // Signature placeholders
+          doc.moveDown(2);
+          doc.text('Customer Signature: ____________________', { continued: true });
+          doc.text('    ');
+          doc.text('Company Signature: ____________________');
+
+          doc.end();
+        } catch (err) {
+          reject(err);
+        }
+      });
     };
 
-    console.log(`⚠️ DB disconnected - transaction created in memory: ${mockTransaction.transactionId}`);
-    res.status(201).json({ success: true, transaction: mockTransaction });
+    const memoBuffer = await generateAdvanceMemoPDF(transaction);
+
+    // Prepare URLs for memo (public endpoint)
+    const baseUrl = process.env.BASE_URL || `${req.protocol}://${req.get('host')}`;
+    const memoUrl = `${baseUrl}/api/advance-transactions/${transaction._id}/memo`;
+
+    // Send email if SMTP configured
+    let emailSent = false;
+    try {
+      if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+        const transporter = nodemailer.createTransport({
+          host: process.env.SMTP_HOST,
+          port: parseInt(process.env.SMTP_PORT || '587'),
+          secure: process.env.SMTP_SECURE === 'true' || false,
+          auth: {
+            user: process.env.SMTP_USER,
+            pass: process.env.SMTP_PASS
+          }
+        });
+
+        const subject = `Advance Booking Confirmation – Samarth Developers Pro Pvt. Ltd.`;
+        const htmlBody = `
+          <p>प्रिय ${transaction.customerName || ''},</p>
+          <p>आपल्या इसारत रकमेचा ₹${transaction.amount} आज ${new Date(transaction.transactionDate).toLocaleDateString()} रोजी स्वीकार करण्यात आला आहे.</p>
+          <p>संबंधित प्लॉट / जमीन: ${transaction.village || ''} – सर्व्हे नं. ${transaction.plotNumber || ''}, एरिया ${transaction.area || ''} sq.ft.</p>
+          <p>एकूण ठरलेली किंमत: ₹${transaction.dealAmount || ''}<br/>उर्वरित देय रकम: ₹${Math.max((transaction.dealAmount || 0) - (transaction.amount || 0),0)}</p>
+          <p>अधिकृत पुष्टीसाठी PDF Memo सोबत जोडला आहे.</p>
+          <p>— SOMANING KOLI – Samarth Developers Pro Pvt. Ltd.<br/>GSTIN: 27DNJPK9124G1ZR</p>
+        `;
+
+        const mailOptions = {
+          from: process.env.FROM_EMAIL || process.env.SMTP_USER,
+          to: transaction.customerEmail || process.env.INTERNAL_NOTIFICATION_EMAIL,
+          subject,
+          html: htmlBody,
+          attachments: [
+            { filename: `${transaction.transactionId || 'advance'}.pdf`, content: memoBuffer }
+          ]
+        };
+
+        await transporter.sendMail(mailOptions);
+        emailSent = true;
+        console.log(`📩 Email sent to ${mailOptions.to} for ${transaction.transactionId}`);
+      } else {
+        console.log('ℹ️ SMTP not configured; skipping email send.');
+      }
+    } catch (err) {
+      console.error('❌ Error sending email:', err.message);
+    }
+
+    // Send WhatsApp message via Twilio if configured
+    let whatsappSent = false;
+    try {
+      if (twilioClient && process.env.TWILIO_WHATSAPP_FROM && transaction.customerPhone) {
+        const phone = transaction.customerPhone.replace(/[^0-9+]/g, '');
+        const toNumber = phone.startsWith('+') ? phone : `+91${phone}`;
+        const whatsappBody = `प्रिय ${transaction.customerName || ''},\nआपल्या इसारत रकमेचा ₹${transaction.amount} (${transaction.transactionId}) प्राप्त झाला आहे. तपशील आणि रसीद पाहण्यासाठी: ${memoUrl}`;
+        await twilioClient.messages.create({
+          from: `whatsapp:${process.env.TWILIO_WHATSAPP_FROM}`,
+          to: `whatsapp:${toNumber}`,
+          body: whatsappBody
+        });
+        whatsappSent = true;
+        console.log(`📲 WhatsApp message sent to ${toNumber} for ${transaction.transactionId}`);
+      } else {
+        console.log('ℹ️ Twilio/WhatsApp not configured or missing customer phone; skipping WhatsApp.');
+      }
+    } catch (err) {
+      console.error('❌ Error sending WhatsApp message:', err.message);
+    }
+
+    // Return transaction with flags and memo URL
+    return res.status(201).json({ success: true, transaction, memoUrl, emailSent, whatsappSent });
   } catch (error) {
     console.error('❌ Error creating advance transaction:', error);
     res.status(500).json({ success: false, message: 'Server error: ' + error.message });
+  }
+});
+
+// GET memo PDF for an advance transaction
+app.get('/api/advance-transactions/:id/memo', async (req, res) => {
+  try {
+    const { id } = req.params;
+    let tx = null;
+    if (mongoose.connection.readyState === 1) {
+      tx = await AdvanceTransaction.findById(id).lean();
+    }
+    if (!tx) {
+      // Try to use query params fallback or return 404
+      return res.status(404).json({ success: false, message: 'Transaction not found' });
+    }
+
+    // Generate PDF and stream
+    const generateAdvanceMemoPDF = (tx) => {
+      return new Promise((resolve, reject) => {
+        try {
+          const doc = new PDFDocument({ size: 'A4', margin: 40 });
+          const chunks = [];
+          doc.on('data', (chunk) => chunks.push(chunk));
+          doc.on('end', () => resolve(Buffer.concat(chunks)));
+
+          doc.fontSize(14).text('Samarth Developers Pro Pvt. Ltd.', { align: 'left' });
+          doc.moveDown(0.2);
+          doc.fontSize(10).text('SOMANING KOLI - Samarth Developers Pro Pvt. Ltd.');
+          doc.fontSize(9).text('GSTIN: 27DNJPK9124G1ZR');
+          doc.moveDown(0.5);
+          doc.fontSize(12).text('Advance Payment Received', { align: 'center' });
+          doc.moveDown(0.5);
+          doc.fontSize(11).text(`Customer: ${tx.customerName || ''}`);
+          doc.text(`Phone: ${tx.customerPhone || ''}`);
+          if (tx.customerEmail) doc.text(`Email: ${tx.customerEmail}`);
+          doc.moveDown(0.3);
+          doc.text(`Village: ${tx.village || ''}    Survey No.: ${tx.plotNumber || ''}    Area: ${tx.area || ''}`);
+          doc.moveDown(0.3);
+          doc.text(`Total Deal Amount: ₹${tx.dealAmount || tx.amount || 0}`);
+          doc.text(`Advance Received: ₹${tx.amount}`);
+          const balance = (tx.dealAmount ? parseFloat(tx.dealAmount || 0) - parseFloat(tx.amount || 0) : 0);
+          doc.text(`Remaining Balance: ₹${balance}`);
+          doc.moveDown(0.3);
+          doc.text(`Payment Mode: ${tx.paymentMode || 'Cash'}`);
+          doc.text(`Date: ${new Date(tx.transactionDate).toLocaleString()}`);
+          doc.moveDown(0.6);
+          doc.text('Notes:', { underline: true });
+          doc.fontSize(9).text(tx.notes || tx.description || '', { align: 'left' });
+          doc.moveDown(1);
+          doc.moveDown(2);
+          doc.text('Customer Signature: ____________________', { continued: true });
+          doc.text('    ');
+          doc.text('Company Signature: ____________________');
+          doc.end();
+        } catch (err) {
+          reject(err);
+        }
+      });
+    };
+
+    const memoBuffer = await generateAdvanceMemoPDF(tx);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${tx.transactionId || 'advance'}.pdf"`);
+    return res.send(memoBuffer);
+  } catch (err) {
+    console.error('❌ Error generating memo PDF:', err.message);
+    res.status(500).json({ success: false, message: 'Failed to generate memo PDF' });
   }
 });
 
